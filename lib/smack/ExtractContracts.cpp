@@ -48,6 +48,13 @@ BlockList blockPrefix(BlockList BBs, Function &F) {
         break;
     }
   }
+
+  SDEBUG(dbgs() << "blockPrefix(";
+    std::for_each(BBs.begin(), BBs.end(), [](BasicBlock *B){ dbgs() << B->getName() << ", "; });
+    dbgs() << ") = {";
+    std::for_each(prefix.begin(), prefix.end(), [](BasicBlock *B){ dbgs() << B->getName() << ", "; });
+    dbgs() << "}\n");
+
   return prefix;
 }
 
@@ -66,6 +73,13 @@ BlockList blockPrefix(BlockList BBs, const Loop &L) {
         break;
     }
   }
+
+  SDEBUG(dbgs() << "blockPrefix(";
+    std::for_each(BBs.begin(), BBs.end(), [](BasicBlock *B){ dbgs() << B->getName() << ", "; });
+    dbgs() << ") = {";
+    std::for_each(prefix.begin(), prefix.end(), [](BasicBlock *B){ dbgs() << B->getName() << ", "; });
+    dbgs() << "}\n");
+
   return prefix;
 }
 
@@ -109,10 +123,17 @@ std::tuple<BlockList, LoopMap> splitContractBlocks(Function &F, LoopInfo &LI) {
 
   contractBlocks = blockPrefix(contractBlocks, F);
 
+  for (auto B : contractBlocks) {
+    SDEBUG(dbgs() << "contract block: " << B->getName() << "\n");
+  }
+
   for (auto const &entry : invariantBlocks) {
     auto L = entry.first;
     auto BBs = entry.second;
-    invariantBlocks[L] = blockPrefix(BBs, *L);
+    auto prefix = blockPrefix(BBs, *L);
+    invariantBlocks[L] = prefix;
+
+    SDEBUG(dbgs() << "invariant blocks entry:\n  " << *L << "\n");
   }
 
   return std::make_tuple(contractBlocks, invariantBlocks);
@@ -206,6 +227,166 @@ std::vector<std::tuple<Function *, Function *>> getContractExprs(Function &F) {
 }
 } // namespace
 
+/// Test whether a block is valid for extraction.
+static bool isBlockValidForExtraction(const BasicBlock &BB,
+                                      const SetVector<BasicBlock *> &Result,
+                                      bool AllowVarArgs, bool AllowAlloca) {
+  // taking the address of a basic block moved to another function is illegal
+  if (BB.hasAddressTaken())
+    return false;
+
+  // don't hoist code that uses another basicblock address, as it's likely to
+  // lead to unexpected behavior, like cross-function jumps
+  SmallPtrSet<User const *, 16> Visited;
+  SmallVector<User const *, 16> ToVisit;
+
+  for (Instruction const &Inst : BB)
+    ToVisit.push_back(&Inst);
+
+  while (!ToVisit.empty()) {
+    User const *Curr = ToVisit.pop_back_val();
+    if (!Visited.insert(Curr).second)
+      continue;
+    if (isa<BlockAddress const>(Curr))
+      return false; // even a reference to self is likely to be not compatible
+
+    if (isa<Instruction>(Curr) && cast<Instruction>(Curr)->getParent() != &BB)
+      continue;
+
+    for (auto const &U : Curr->operands()) {
+      if (auto *UU = dyn_cast<User>(U))
+        ToVisit.push_back(UU);
+    }
+  }
+
+  // If explicitly requested, allow vastart and alloca. For invoke instructions
+  // verify that extraction is valid.
+  for (BasicBlock::const_iterator I = BB.begin(), E = BB.end(); I != E; ++I) {
+    if (isa<AllocaInst>(I)) {
+       if (!AllowAlloca)
+         return false;
+       continue;
+    }
+
+    if (const auto *II = dyn_cast<InvokeInst>(I)) {
+      // Unwind destination (either a landingpad, catchswitch, or cleanuppad)
+      // must be a part of the subgraph which is being extracted.
+      if (auto *UBB = II->getUnwindDest())
+        if (!Result.count(UBB))
+          return false;
+      continue;
+    }
+
+    // All catch handlers of a catchswitch instruction as well as the unwind
+    // destination must be in the subgraph.
+    if (const auto *CSI = dyn_cast<CatchSwitchInst>(I)) {
+      if (auto *UBB = CSI->getUnwindDest())
+        if (!Result.count(UBB))
+          return false;
+      for (auto *HBB : CSI->handlers())
+        if (!Result.count(const_cast<BasicBlock*>(HBB)))
+          return false;
+      continue;
+    }
+
+    // Make sure that entire catch handler is within subgraph. It is sufficient
+    // to check that catch return's block is in the list.
+    if (const auto *CPI = dyn_cast<CatchPadInst>(I)) {
+      for (const auto *U : CPI->users())
+        if (const auto *CRI = dyn_cast<CatchReturnInst>(U))
+          if (!Result.count(const_cast<BasicBlock*>(CRI->getParent())))
+            return false;
+      continue;
+    }
+
+    // And do similar checks for cleanup handler - the entire handler must be
+    // in subgraph which is going to be extracted. For cleanup return should
+    // additionally check that the unwind destination is also in the subgraph.
+    if (const auto *CPI = dyn_cast<CleanupPadInst>(I)) {
+      for (const auto *U : CPI->users())
+        if (const auto *CRI = dyn_cast<CleanupReturnInst>(U))
+          if (!Result.count(const_cast<BasicBlock*>(CRI->getParent())))
+            return false;
+      continue;
+    }
+    if (const auto *CRI = dyn_cast<CleanupReturnInst>(I)) {
+      if (auto *UBB = CRI->getUnwindDest())
+        if (!Result.count(UBB))
+          return false;
+      continue;
+    }
+
+    if (const CallInst *CI = dyn_cast<CallInst>(I)) {
+      if (const Function *F = CI->getCalledFunction()) {
+        auto IID = F->getIntrinsicID();
+        if (IID == Intrinsic::vastart) {
+          if (AllowVarArgs)
+            continue;
+          else
+            return false;
+        }
+
+        // Currently, we miscompile outlined copies of eh_typid_for. There are
+        // proposals for fixing this in llvm.org/PR39545.
+        if (IID == Intrinsic::eh_typeid_for)
+          return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+ /// Build a set of blocks to extract if the input blocks are viable.
+ static SetVector<BasicBlock *>
+ buildExtractionBlockSet(ArrayRef<BasicBlock *> BBs, DominatorTree *DT,
+                         bool AllowVarArgs, bool AllowAlloca) {
+   assert(!BBs.empty() && "The set of blocks to extract must be non-empty");
+   SetVector<BasicBlock *> Result;
+
+   // Loop over the blocks, adding them to our set-vector, and aborting with an
+   // empty set if we encounter invalid blocks.
+   for (BasicBlock *BB : BBs) {
+     // If this block is dead, don't process it.
+     if (DT && !DT->isReachableFromEntry(BB))
+       continue;
+
+     if (!Result.insert(BB))
+       llvm_unreachable("Repeated basic blocks in extraction input");
+   }
+
+   SDEBUG(dbgs() << "Region front block: " << Result.front()->getName()
+                     << '\n');
+
+   for (auto *BB : Result) {
+     if (!isBlockValidForExtraction(*BB, Result, AllowVarArgs, AllowAlloca))
+       return {};
+
+     // Make sure that the first block is not a landing pad.
+     if (BB == Result.front()) {
+       if (BB->isEHPad()) {
+         SDEBUG(dbgs() << "The first block cannot be an unwind block\n");
+         return {};
+       }
+       continue;
+     }
+
+     // All blocks other than the first must not have predecessors outside of
+     // the subgraph which is being extracted.
+     for (auto *PBB : predecessors(BB))
+       if (!Result.count(PBB)) {
+         SDEBUG(dbgs() << "No blocks in this region may have entries from "
+                              "outside the region except for the first block!\n"
+                           << "Problematic source BB: " << BB->getName() << "\n"
+                           << "Problematic destination BB: " << PBB->getName()
+                           << "\n");
+         return {};
+       }
+   }
+
+   return Result;
+ }
+
 bool ExtractContracts::runOnModule(Module &M) {
   bool modified = false;
 
@@ -258,7 +439,12 @@ bool ExtractContracts::runOnModule(Module &M) {
 
     for (auto const &entry : invariantBlocks) {
       auto BBs = entry.second;
-      auto *newF = CodeExtractor(BBs).extractCodeRegion();
+      CodeExtractor extractor(BBs);
+      buildExtractionBlockSet(BBs, nullptr, false, false);
+      assert(extractor.isEligible() && "Code is not eligible for extraction.");
+
+      auto *newF = extractor.extractCodeRegion();
+      assert(newF && "Extracted function is empty.");
 
       std::vector<CallInst *> Is;
       for (auto V : newF->users())
